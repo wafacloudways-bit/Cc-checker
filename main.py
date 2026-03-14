@@ -1,86 +1,68 @@
 import os
 import logging
+import sys
 from dotenv import load_dotenv
-from card_validator import Luhn
-from telegram import Update, constants
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # Load environment variables
 load_dotenv()
 
+# --- Professional Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Dependency Check ---
+try:
+    from card_validator import Luhn
+    from telegram import Update, constants
+    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+except ImportError as e:
+    logger.error(f"Required library missing: {e}")
+    sys.exit(1)
+
+# --- Configuration ---
 class Config:
-    """Centralized configuration management."""
     TOKEN = os.getenv("BOT_TOKEN")
     CHANNEL_ID = os.getenv("CHANNEL_ID")
-    LOG_LEVEL = logging.INFO
 
 class CardProcessor:
-    """Handles the logic of cleaning and validating card data."""
     @staticmethod
-    def clean_input(text: str) -> str:
-        return "".join(filter(str.isdigit, text))
+    def validate(text: str):
+        clean_num = "".join(filter(str.isdigit, text))
+        if 13 <= len(clean_num) <= 19:
+            is_valid = Luhn.is_valid(clean_num)
+            # Basic Issuer Detection
+            brands = {"4": "VISA", "5": "MASTERCARD", "3": "AMEX", "6": "DISCOVER"}
+            issuer = brands.get(clean_num[0], "UNKNOWN")
+            return is_valid, clean_num, issuer
+        return False, None, None
 
-    @staticmethod
-    def validate_card(number: str) -> bool:
-        return Luhn.is_valid(number)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🛡️ **Validator Active**\nSend card details to check.", parse_mode=constants.ParseMode.MARKDOWN)
 
-    @staticmethod
-    def get_issuer(number: str) -> str:
-        prefixes = {"4": "VISA", "5": "MASTERCARD", "3": "AMEX", "6": "DISCOVER"}
-        return prefixes.get(number[0], "UNKNOWN")
-
-class TelegramBot:
-    """The main Bot application class."""
-    def __init__(self):
-        logging.basicConfig(
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=Config.LOG_LEVEL
-        )
-        self.logger = logging.getLogger(__name__)
-
-    async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🛡️ **Validator System Active**\n\n"
-            "Submit card details below. All valid hits are logged to the secure channel.",
-            parse_mode=constants.ParseMode.MARKDOWN
-        )
-
-    async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        clean_num = CardProcessor.clean_input(update.message.text)
-
-        # Basic filter for card-length strings
-        if not (13 <= len(clean_num) <= 19):
-            return
-
-        if CardProcessor.validate_card(clean_num):
-            issuer = CardProcessor.get_issuer(clean_num)
-            report = (
-                f"✅ **Card Validated**\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"**Issuer:** `{issuer}`\n"
-                f"**Number:** `{clean_num}`\n"
-                f"**Status:** LUHN_PASSED"
-            )
-            try:
-                await context.bot.send_message(chat_id=Config.CHANNEL_ID, text=report, parse_mode=constants.ParseMode.MARKDOWN)
-                await update.message.reply_text("✨ Validated and forwarded.")
-            except Exception as e:
-                self.logger.error(f"Forwarding failed: {e}")
-        else:
-            await update.message.reply_text("❌ Invalid Checksum.")
-
-    def run(self):
-        if not Config.TOKEN:
-            self.logger.error("BOT_TOKEN missing in environment!")
-            return
-        
-        app = ApplicationBuilder().token(Config.TOKEN).build()
-        app.add_handler(CommandHandler("start", self.start_handler))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
-        
-        self.logger.info("Bot is polling...")
-        app.run_polling()
+async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_valid, num, issuer = CardProcessor.validate(update.message.text)
+    
+    if is_valid:
+        report = f"✅ **Valid Card**\n━━━━━━━━━━━━━━\n**Issuer:** {issuer}\n**Number:** `{num}`"
+        try:
+            await context.bot.send_message(chat_id=Config.CHANNEL_ID, text=report, parse_mode=constants.ParseMode.MARKDOWN)
+            await update.message.reply_text("✅ Forwarded to channel.")
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+    elif num: # Only reply if it actually looked like a card number
+        await update.message.reply_text("❌ Invalid Checksum.")
 
 if __name__ == "__main__":
-    TelegramBot().run()
-  
+    if not Config.TOKEN or not Config.CHANNEL_ID:
+        logger.error("BOT_TOKEN or CHANNEL_ID is missing!")
+        sys.exit(1)
+        
+    app = ApplicationBuilder().token(Config.TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    
+    logger.info("Bot is running...")
+    app.run_polling()
